@@ -33,21 +33,27 @@ This script provides a unified interface for creating, updating, and managing Kl
 
 ## 🚀 Installation
 
-### Step 1: Download the Script
+### Quick Install (One Command)
 
 ```bash
-wget https://klever-radar.de/software/nodes/klever_node_manager.sh
+curl -sSL https://raw.githubusercontent.com/CTJaeger/KleverNodeManagement/main/klever_node_manager.sh | sudo bash
 ```
 
-Or upload it via SCP/SFTP to your server.
+### Manual Install
 
-### Step 2: Make Executable
+**Step 1: Download the Script**
+
+```bash
+wget https://raw.githubusercontent.com/CTJaeger/KleverNodeManagement/main/klever_node_manager.sh
+```
+
+**Step 2: Make Executable**
 
 ```bash
 chmod +x klever_node_manager.sh
 ```
 
-### Step 3: Run the Script
+**Step 3: Run the Script**
 
 ```bash
 sudo ./klever_node_manager.sh
