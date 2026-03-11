@@ -258,7 +258,7 @@ Update Summary:
   • Total nodes to update: 3
   • Normal validators:     2
   • Fallback nodes:        1
-  • Configuration source:  https://backup.mainnet.klever.org/config.mainnet.108.tar.gz
+  • Configuration source:  backup.mainnet.klever.org (fallback: klever-io/klever-go)
   • Docker image:          kleverapp/klever-go:latest
 
   • Running version:       v0.8.1

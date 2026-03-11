@@ -504,42 +504,50 @@ create_node() {
     # Download configuration
     echo -e "${CYAN}  Downloading configuration...${RESET}"
     local config_downloaded=false
+
+    # Try primary source: official Klever backup
     local tmp_file
     tmp_file=$(make_temp_file "config_${node_name}")
 
-    # Try primary source
     if curl -s -f -o "$tmp_file" "https://backup.mainnet.klever.org/config.mainnet.108.tar.gz" 2>/dev/null; then
-        config_downloaded=true
-        echo -e "${GREEN}  ✓ Configuration downloaded from primary source${RESET}"
-    else
-        echo -e "${YELLOW}  Primary source unavailable, trying secondary...${RESET}"
-        if curl -s -f -o "$tmp_file" "https://klever-radar.de/software/nodes/config.tar.gz" 2>/dev/null; then
+        pushd "$node_path/config" > /dev/null || return 1
+        tar -xzf "$tmp_file" --strip-components=1 2>/dev/null
+        local extract_status=$?
+        popd > /dev/null || true
+        rm -f "$tmp_file"
+        if [ $extract_status -eq 0 ]; then
             config_downloaded=true
-            echo -e "${GREEN}  ✓ Configuration downloaded from secondary source${RESET}"
+            echo -e "${GREEN}  ✓ Configuration downloaded from primary source${RESET}"
+        fi
+    else
+        rm -f "$tmp_file"
+    fi
+
+    # Fallback: individual files from GitHub (transparent & auditable)
+    if [ "$config_downloaded" = false ]; then
+        echo -e "${YELLOW}  Primary source unavailable, trying GitHub fallback...${RESET}"
+        local github_base="https://raw.githubusercontent.com/klever-io/klever-go/develop/config/node"
+        local config_files=("api.yaml" "config.yaml" "enableEpochs.yaml" "external.yaml" "gasScheduleV1.yaml" "genesis.json" "nodesSetup.json")
+        local all_ok=true
+
+        for cfg_file in "${config_files[@]}"; do
+            if ! curl -s -f -o "$node_path/config/$cfg_file" "$github_base/$cfg_file" 2>/dev/null; then
+                all_ok=false
+                break
+            fi
+        done
+
+        if [ "$all_ok" = true ]; then
+            config_downloaded=true
+            echo -e "${GREEN}  ✓ Configuration downloaded from GitHub${RESET}"
         fi
     fi
 
     if [ "$config_downloaded" = false ]; then
-        rm -f "$tmp_file"
-        echo -e "${RED}✗ Could not download configuration file.${RESET}"
+        echo -e "${RED}✗ Could not download configuration files.${RESET}"
         cleanup_failed_node
         return 1
     fi
-
-    # Extract configuration
-    echo -e "${CYAN}  Extracting configuration...${RESET}"
-    pushd "$node_path/config" > /dev/null || return 1
-    tar -xzf "$tmp_file" --strip-components=1 2>/dev/null
-    local extract_status=$?
-    popd > /dev/null || true
-    rm -f "$tmp_file"
-
-    if [ $extract_status -ne 0 ]; then
-        echo -e "${RED}✗ Failed to extract configuration.${RESET}"
-        cleanup_failed_node
-        return 1
-    fi
-    echo -e "${GREEN}  ✓ Configuration extracted${RESET}"
 
     # Generate validator keys if needed
     if [[ "$generate_keys" == "y" ]]; then
@@ -819,28 +827,50 @@ update_node() {
 
     # Download configuration
     echo -e "${CYAN}  Downloading latest configuration...${RESET}"
+    local config_downloaded=false
+
+    # Try primary source: official Klever backup
     local tmp_file
     tmp_file=$(make_temp_file "config_update_${node_name}")
-    if ! curl -s -f -o "$tmp_file" "https://backup.mainnet.klever.org/config.mainnet.108.tar.gz" 2>/dev/null; then
+
+    if curl -s -f -o "$tmp_file" "https://backup.mainnet.klever.org/config.mainnet.108.tar.gz" 2>/dev/null; then
+        pushd "$node_dir" > /dev/null || return 1
+        tar -xzf "$tmp_file" --strip-components=1 -C ./config 2>/dev/null
+        local extract_status=$?
+        popd > /dev/null || true
         rm -f "$tmp_file"
-        echo -e "${RED}✗ Failed to download configuration file.${RESET}"
+        if [ $extract_status -eq 0 ]; then
+            config_downloaded=true
+            echo -e "${GREEN}  ✓ Configuration downloaded${RESET}"
+        fi
+    else
+        rm -f "$tmp_file"
+    fi
+
+    # Fallback: individual files from GitHub (transparent & auditable)
+    if [ "$config_downloaded" = false ]; then
+        echo -e "${YELLOW}  Primary source unavailable, trying GitHub fallback...${RESET}"
+        local github_base="https://raw.githubusercontent.com/klever-io/klever-go/develop/config/node"
+        local config_files=("api.yaml" "config.yaml" "enableEpochs.yaml" "external.yaml" "gasScheduleV1.yaml" "genesis.json" "nodesSetup.json")
+        local all_ok=true
+
+        for cfg_file in "${config_files[@]}"; do
+            if ! curl -s -f -o "$node_dir/config/$cfg_file" "$github_base/$cfg_file" 2>/dev/null; then
+                all_ok=false
+                break
+            fi
+        done
+
+        if [ "$all_ok" = true ]; then
+            config_downloaded=true
+            echo -e "${GREEN}  ✓ Configuration downloaded from GitHub${RESET}"
+        fi
+    fi
+
+    if [ "$config_downloaded" = false ]; then
+        echo -e "${RED}✗ Failed to download configuration files.${RESET}"
         return 1
     fi
-    echo -e "${GREEN}  ✓ Configuration downloaded${RESET}"
-
-    # Extract configuration
-    echo -e "${CYAN}  Extracting configuration...${RESET}"
-    pushd "$node_dir" > /dev/null || return 1
-    tar -xzf "$tmp_file" --strip-components=1 -C ./config 2>/dev/null
-    local extract_status=$?
-    popd > /dev/null || true
-    rm -f "$tmp_file"
-
-    if [ $extract_status -ne 0 ]; then
-        echo -e "${RED}✗ Failed to extract configuration.${RESET}"
-        return 1
-    fi
-    echo -e "${GREEN}  ✓ Configuration extracted${RESET}"
 
     # Stop and remove container
     if docker ps -a --format '{{.Names}}' | grep -q "^${container_name}$"; then
@@ -989,7 +1019,7 @@ module_update_nodes() {
     echo -e "${WHITE}  • Total nodes to update: ${CYAN}${#nodes_to_update[@]}${RESET}"
     echo -e "${WHITE}  • Normal validators:     ${GREEN}$normal_count${RESET}"
     echo -e "${WHITE}  • Fallback nodes:        ${YELLOW}$fallback_count${RESET}"
-    echo -e "${WHITE}  • Configuration source:  ${CYAN}https://backup.mainnet.klever.org/config.mainnet.108.tar.gz${RESET}"
+    echo -e "${WHITE}  • Configuration source:  ${CYAN}backup.mainnet.klever.org (fallback: klever-io/klever-go)${RESET}"
     echo -e "${WHITE}  • Docker image:          ${CYAN}kleverapp/klever-go:${DOCKER_IMAGE_TAG}${RESET}"
     echo
     echo -e "${WHITE}  • Running version:       ${CYAN}$current_version${RESET}"
