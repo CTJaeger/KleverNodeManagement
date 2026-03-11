@@ -1,0 +1,3 @@
+# SC2034: Unused variables - false positives for color constants and
+#         variables used indirectly (e.g., image in docker parse loop)
+disable=SC2034

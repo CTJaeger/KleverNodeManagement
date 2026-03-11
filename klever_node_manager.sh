@@ -1,9 +1,13 @@
 #!/bin/bash
 
+set -u
+
 ################################################################################
 #                     Klever Node Management Suite                             #
 #                      Created by CryptoJaeger^^                               #
 ################################################################################
+
+VERSION="1.1.0"
 
 # Color definitions
 RED='\e[31m'
@@ -39,7 +43,10 @@ show_progress() {
     local message=$2
     local progress=0
     local bar_length=50
-    
+    local steps=50
+    local sleep_time
+    sleep_time=$(awk "BEGIN {printf \"%.4f\", $duration / $steps}")
+
     echo -ne "${CYAN}${message}${RESET} "
     while [ $progress -le 100 ]; do
         local filled=$((progress * bar_length / 100))
@@ -49,25 +56,32 @@ show_progress() {
         printf "%${empty}s" | tr ' ' ' '
         printf "] ${progress}%%"
         progress=$((progress + 2))
-        sleep $(echo "$duration / 50" | bc -l)
+        sleep "$sleep_time"
     done
     echo -e " ${GREEN}✓${RESET}"
 }
 
-# Spinner for indeterminate progress
+# Spinner for indeterminate progress. Waits for PID and returns its exit code.
 show_spinner() {
     local pid=$1
     local message=$2
     local spin='-\|/'
     local i=0
-    
+
     echo -ne "${CYAN}${message}${RESET} "
-    while kill -0 $pid 2>/dev/null; do
+    while kill -0 "$pid" 2>/dev/null; do
         i=$(( (i+1) %4 ))
         printf "\r${CYAN}${message}${RESET} ${spin:$i:1}"
         sleep 0.1
     done
-    printf "\r${CYAN}${message}${RESET} ${GREEN}✓${RESET}\n"
+    wait "$pid"
+    local exit_code=$?
+    if [ $exit_code -eq 0 ]; then
+        printf "\r${CYAN}${message}${RESET} ${GREEN}✓${RESET}\n"
+    else
+        printf "\r${CYAN}${message}${RESET} ${RED}✗${RESET}\n"
+    fi
+    return $exit_code
 }
 
 # Wait for user
@@ -75,6 +89,26 @@ press_any_key() {
     echo
     echo -e "${YELLOW}Press any key to continue...${RESET}"
     read -n 1 -s
+}
+
+# Prompt user for y/n confirmation. Returns the answer via stdout.
+confirm_yn() {
+    local prompt=$1
+    local answer
+    while true; do
+        read -p $'\e[35m'"${prompt}"$' (y/n): \e[0m' answer
+        if [[ "$answer" == "y" || "$answer" == "n" ]]; then
+            echo "$answer"
+            return
+        fi
+        echo -e "${RED}Please enter 'y' or 'n'.${RESET}" >&2
+    done
+}
+
+# Create a secure temporary file. Caller must clean up.
+make_temp_file() {
+    local prefix=${1:-klever}
+    mktemp "/tmp/${prefix}_XXXXXX"
 }
 
 # Check if script is run as root
@@ -125,30 +159,31 @@ check_docker_installed() {
 # Install Docker
 install_docker() {
     echo -e "${CYAN}Installing Docker...${RESET}"
-    
+
     (
         apt-get update > /dev/null 2>&1
         apt-get install -y ca-certificates curl > /dev/null 2>&1
         mkdir -p /etc/apt/keyrings
-        curl -fsSL https://download.docker.com/linux/$DISTRO/gpg -o /etc/apt/keyrings/docker.asc > /dev/null 2>&1
+        curl -fsSL "https://download.docker.com/linux/$DISTRO/gpg" -o /etc/apt/keyrings/docker.asc > /dev/null 2>&1
         chmod a+r /etc/apt/keyrings/docker.asc
         echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/$DISTRO $CODENAME stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
         apt-get update > /dev/null 2>&1
         apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin > /dev/null 2>&1
     ) &
-    
-    show_spinner $! "Installing Docker"
-    
-    if [ $? -eq 0 ]; then
+    local bg_pid=$!
+    show_spinner $bg_pid "Installing Docker"
+    local install_result=$?
+
+    if [ $install_result -eq 0 ]; then
         systemctl enable --now docker > /dev/null 2>&1
         if ! systemctl is-active --quiet docker; then
             echo -e "${RED}Docker service failed to start. Please check manually.${RESET}"
             exit 1
         fi
         echo -e "${GREEN}Docker installed successfully.${RESET}"
-        
+
         # Add the original user to docker group
-        if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+        if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER:-}" != "root" ]; then
             usermod -aG docker "$SUDO_USER" 2>/dev/null || true
             echo -e "${YELLOW}User $SUDO_USER added to docker group. Log out and back in for changes to take effect.${RESET}"
         fi
@@ -167,19 +202,12 @@ check_jq_installed() {
             apt-get install -y jq > /dev/null 2>&1
         ) &
         show_spinner $! "Installing jq"
-        
+
         if ! command -v jq &> /dev/null; then
             echo -e "${RED}Failed to install jq. Please install it manually.${RESET}"
             exit 1
         fi
         echo -e "${GREEN}jq installed successfully.${RESET}"
-    fi
-}
-
-# Check and install bc for calculations
-check_bc_installed() {
-    if ! command -v bc &> /dev/null; then
-        apt-get install -y bc > /dev/null 2>&1
     fi
 }
 
@@ -189,8 +217,9 @@ check_bc_installed() {
 
 # Find all Klever node directories and containers
 find_node_directories() {
-    docker ps -a --format '{{.ID}} {{.Image}} {{.Names}}' | grep 'kleverapp/klever-go' | while read container_id image container_name; do
-        dirs=$(docker inspect "$container_id" 2>/dev/null | jq -r '.[].Mounts[] | select(.Destination | startswith("/opt/klever-blockchain")) | .Source' 2>/dev/null | while read dir; do dirname "$dir"; done | sort -u)
+    docker ps -a --format '{{.ID}} {{.Image}} {{.Names}}' | grep 'kleverapp/klever-go' | while read -r container_id image container_name; do
+        local dirs
+        dirs=$(docker inspect "$container_id" 2>/dev/null | jq -r '.[].Mounts[] | select(.Destination | startswith("/opt/klever-blockchain")) | .Source' 2>/dev/null | while read -r dir; do dirname "$dir"; done | sort -u)
         for dir in $dirs; do
             if [ -d "$dir" ]; then
                 echo "$dir $container_name"
@@ -241,10 +270,11 @@ extract_node_parameters() {
 # Fix permissions for a node directory
 fix_node_permissions() {
     local node_dir=$1
-    local node_name=$(basename "$node_dir")
-    
+    local node_name
+    node_name=$(basename "$node_dir")
+
     echo -e "${CYAN}Fixing permissions for $node_name...${RESET}"
-    
+
     # Check and create directories if they don't exist
     for subdir in config db logs wallet; do
         if [ ! -d "$node_dir/$subdir" ]; then
@@ -252,19 +282,16 @@ fix_node_permissions() {
             echo -e "${YELLOW}  Created missing directory: $subdir${RESET}"
         fi
     done
-    
+
     # Set ownership to 999:999
     chown -R 999:999 "$node_dir" 2>/dev/null
-    chown -R 999:999 "$node_dir/config" 2>/dev/null
-    chown -R 999:999 "$node_dir/db" 2>/dev/null
-    chown -R 999:999 "$node_dir/logs" 2>/dev/null
-    chown -R 999:999 "$node_dir/wallet" 2>/dev/null
-    
+
     # Verify permissions
     local all_correct=true
     for subdir in config db logs wallet; do
         if [ -d "$node_dir/$subdir" ]; then
-            local owner=$(stat -c '%u:%g' "$node_dir/$subdir" 2>/dev/null)
+            local owner
+            owner=$(stat -c '%u:%g' "$node_dir/$subdir" 2>/dev/null)
             if [ "$owner" != "999:999" ]; then
                 echo -e "${RED}  ✗ Failed to set permissions for $subdir (current: $owner)${RESET}"
                 all_correct=false
@@ -273,7 +300,7 @@ fix_node_permissions() {
             fi
         fi
     done
-    
+
     if [ "$all_correct" = true ]; then
         echo -e "${GREEN}All permissions set correctly for $node_name.${RESET}"
         return 0
@@ -287,41 +314,140 @@ fix_node_permissions() {
 # CREATE NODES MODULE
 ################################################################################
 
+# Docker image tag (default: latest, can be overridden per session)
+DOCKER_IMAGE_TAG="latest"
+
+# Prompt user to select a Docker image tag from available tags
+select_docker_image_tag() {
+    echo -e "${CYAN}Fetching available image tags...${RESET}"
+    local tags_json
+    tags_json=$(curl -s --connect-timeout 5 --max-time 10 \
+        "https://hub.docker.com/v2/repositories/kleverapp/klever-go/tags/?page_size=100&ordering=last_updated" 2>/dev/null)
+
+    local tags=()
+    if [[ -n "$tags_json" ]]; then
+        local parsed
+        parsed=$(echo "$tags_json" | jq -r '.results[].name' 2>/dev/null)
+        if [[ -n "$parsed" ]]; then
+            while IFS= read -r tag; do
+                # Skip dev, testnet, devnet, alpine, and val-only images
+                [[ "$tag" == dev-* ]] && continue
+                [[ "$tag" == *-testnet ]] && continue
+                [[ "$tag" == *-devnet ]] && continue
+                [[ "$tag" == val-* ]] && continue
+                [[ "$tag" == alpine-* ]] && continue
+                tags+=("$tag")
+                # Limit to 15 filtered results
+                [[ ${#tags[@]} -ge 15 ]] && break
+            done <<< "$parsed"
+        fi
+    fi
+
+    if [[ ${#tags[@]} -eq 0 ]]; then
+        echo -e "${YELLOW}Could not fetch tags. Using default.${RESET}"
+        echo -ne "${YELLOW}Docker image tag ${WHITE}[latest]${YELLOW}: ${RESET}"
+        local input_tag
+        read -r input_tag
+        if [[ -n "$input_tag" ]]; then
+            DOCKER_IMAGE_TAG="$input_tag"
+        else
+            DOCKER_IMAGE_TAG="latest"
+        fi
+        return
+    fi
+
+    echo
+    echo -e "${WHITE}${BOLD}Available image tags:${RESET}"
+    echo
+    local i=1
+    for tag in "${tags[@]}"; do
+        if [[ "$tag" == "latest" ]]; then
+            printf "  ${GREEN}${BOLD}[%2d] %-30s (default)${RESET}\n" "$i" "$tag"
+        else
+            printf "  ${WHITE}[%2d] ${CYAN}%-30s${RESET}\n" "$i" "$tag"
+        fi
+        ((i++))
+    done
+    echo
+    echo -ne "${YELLOW}Select tag number or type custom tag ${WHITE}[latest]${YELLOW}: ${RESET}"
+    local selection
+    read -r selection
+
+    if [[ -z "$selection" ]]; then
+        DOCKER_IMAGE_TAG="latest"
+    elif [[ "$selection" =~ ^[0-9]+$ ]] && [[ "$selection" -ge 1 ]] && [[ "$selection" -le ${#tags[@]} ]]; then
+        DOCKER_IMAGE_TAG="${tags[$((selection - 1))]}"
+    else
+        DOCKER_IMAGE_TAG="$selection"
+    fi
+
+    echo -e "${GREEN}Selected: kleverapp/klever-go:${DOCKER_IMAGE_TAG}${RESET}"
+}
+
+# Start a Klever node Docker container
+start_node_container() {
+    local container_name=$1
+    local node_dir=$2
+    local rest_api_port=$3
+    local display_name=$4
+    local redundancy=${5:-}
+
+    docker run -d \
+        --restart unless-stopped \
+        --user "999:999" \
+        --name "$container_name" \
+        -v "$node_dir/config:/opt/klever-blockchain/config/node" \
+        -v "$node_dir/db:/opt/klever-blockchain/db" \
+        -v "$node_dir/logs:/opt/klever-blockchain/logs" \
+        -v "$node_dir/wallet:/opt/klever-blockchain/wallet" \
+        --network=host \
+        --entrypoint=/usr/local/bin/validator \
+        "kleverapp/klever-go:${DOCKER_IMAGE_TAG}" \
+        '--log-save' '--use-log-view' "--rest-api-interface=0.0.0.0:$rest_api_port" \
+        "--display-name=$display_name" '--start-in-epoch' $redundancy > /dev/null 2>&1
+}
+
 # Find next available node number and port
 find_next_available_node() {
     local base_path=$1
-    local existing_nodes=$(find_node_directories 2>/dev/null)
-    
+    local existing_nodes
+    existing_nodes=$(find_node_directories 2>/dev/null)
+
     # Find highest existing node number
     local max_node_num=0
     local max_port=8079
-    
+
     if [[ -n "$existing_nodes" ]]; then
         while IFS= read -r line; do
-            local node_dir=$(echo "$line" | awk '{print $1}')
-            local container_name=$(echo "$line" | awk '{print $2}')
-            local node_name=$(basename "$node_dir")
-            
+            local node_dir
+            node_dir=$(echo "$line" | awk '{print $1}')
+            local container_name
+            container_name=$(echo "$line" | awk '{print $2}')
+            local node_name
+            node_name=$(basename "$node_dir")
+
             # Extract node number
             if [[ $node_name =~ node([0-9]+) ]]; then
                 local node_num=${BASH_REMATCH[1]}
-                if [ $node_num -gt $max_node_num ]; then
+                if [ "$node_num" -gt "$max_node_num" ]; then
                     max_node_num=$node_num
                 fi
             fi
-            
+
             # Extract port
-            local params=$(extract_node_parameters "$container_name" "$node_name")
-            local port=$(echo "$params" | cut -d'|' -f1)
-            if [ $port -gt $max_port ]; then
+            local params
+            params=$(extract_node_parameters "$container_name" "$node_name")
+            local port
+            port=$(echo "$params" | cut -d'|' -f1)
+            if [ "$port" -gt "$max_port" ]; then
                 max_port=$port
             fi
         done <<< "$existing_nodes"
     fi
-    
+
     local next_node_num=$((max_node_num + 1))
     local next_port=$((max_port + 1))
-    
+
     echo "$next_node_num|$next_port"
 }
 
@@ -330,20 +456,20 @@ create_node() {
     local base_path=$2
     local redundancy=$3
     local generate_keys=$4
-    local start_port=$5  # New parameter for starting port
+    local start_port=$5
     local node_name="node$node_number"
-    local rest_api_port=${start_port:-$((8080 + $node_number - 1))}
+    local rest_api_port=${start_port:-$((8080 + node_number - 1))}
     local node_path="$base_path/$node_name"
 
     echo
     echo -e "${CYAN}${BOLD}Creating $node_name...${RESET}"
-    
+
     # Check if node directory already exists
     if [ -d "$node_path" ]; then
         echo -e "${RED}✗ Directory $node_path already exists. Skipping.${RESET}"
         return 1
     fi
-    
+
     # Check if container exists
     if docker ps -a --format '{{.Names}}' | grep -q "^klever-${node_name}$"; then
         echo -e "${RED}✗ Container klever-$node_name already exists. Skipping.${RESET}"
@@ -351,7 +477,7 @@ create_node() {
     fi
 
     # Check if port is available
-    if ! check_port $rest_api_port; then
+    if ! check_port "$rest_api_port"; then
         echo -e "${RED}✗ Port $rest_api_port is already in use.${RESET}"
         echo -e "${YELLOW}  Please use a different port or stop the service using this port.${RESET}"
         return 1
@@ -366,40 +492,51 @@ create_node() {
     fi
     echo -e "${GREEN}  ✓ Directories created${RESET}"
 
+    # Define cleanup for partial failures after directory creation
+    cleanup_failed_node() {
+        echo -e "${YELLOW}  Cleaning up partial installation...${RESET}"
+        rm -rf "$node_path"
+    }
+
     # Fix permissions
     fix_node_permissions "$node_path"
 
     # Download configuration
     echo -e "${CYAN}  Downloading configuration...${RESET}"
     local config_downloaded=false
-    
+    local tmp_file
+    tmp_file=$(make_temp_file "config_${node_name}")
+
     # Try primary source
-    if curl -k -s -f -o /tmp/config_${node_name}.tar.gz "https://backup.mainnet.klever.org/config.mainnet.108.tar.gz" 2>/dev/null; then
+    if curl -s -f -o "$tmp_file" "https://backup.mainnet.klever.org/config.mainnet.108.tar.gz" 2>/dev/null; then
         config_downloaded=true
         echo -e "${GREEN}  ✓ Configuration downloaded from primary source${RESET}"
     else
         echo -e "${YELLOW}  Primary source unavailable, trying secondary...${RESET}"
-        if curl -s -f -o /tmp/config_${node_name}.tar.gz "https://klever-radar.de/software/nodes/config.tar.gz" 2>/dev/null; then
+        if curl -s -f -o "$tmp_file" "https://klever-radar.de/software/nodes/config.tar.gz" 2>/dev/null; then
             config_downloaded=true
             echo -e "${GREEN}  ✓ Configuration downloaded from secondary source${RESET}"
         fi
     fi
-    
+
     if [ "$config_downloaded" = false ]; then
+        rm -f "$tmp_file"
         echo -e "${RED}✗ Could not download configuration file.${RESET}"
+        cleanup_failed_node
         return 1
     fi
 
     # Extract configuration
     echo -e "${CYAN}  Extracting configuration...${RESET}"
-    pushd "$node_path/config" > /dev/null
-    tar -xzf /tmp/config_${node_name}.tar.gz --strip-components=1 2>/dev/null
+    pushd "$node_path/config" > /dev/null || return 1
+    tar -xzf "$tmp_file" --strip-components=1 2>/dev/null
     local extract_status=$?
-    popd > /dev/null
-    rm -f /tmp/config_${node_name}.tar.gz
-    
+    popd > /dev/null || true
+    rm -f "$tmp_file"
+
     if [ $extract_status -ne 0 ]; then
         echo -e "${RED}✗ Failed to extract configuration.${RESET}"
+        cleanup_failed_node
         return 1
     fi
     echo -e "${GREEN}  ✓ Configuration extracted${RESET}"
@@ -409,9 +546,10 @@ create_node() {
         echo -e "${CYAN}  Generating validator keys...${RESET}"
         docker run -it --rm -v "$node_path/config:/opt/klever-blockchain" \
             --user "999:999" \
-            --entrypoint='' kleverapp/klever-go:latest keygenerator > /dev/null 2>&1
+            --entrypoint='' "kleverapp/klever-go:${DOCKER_IMAGE_TAG}" keygenerator > /dev/null 2>&1
         if [ $? -ne 0 ]; then
             echo -e "${RED}✗ Failed to generate validator key.${RESET}"
+            cleanup_failed_node
             return 1
         fi
         echo -e "${GREEN}  ✓ Validator keys generated${RESET}"
@@ -419,26 +557,13 @@ create_node() {
 
     # Start Docker container
     echo -e "${CYAN}  Starting Docker container...${RESET}"
-    docker run -it -d \
-        --restart unless-stopped \
-        --user "999:999" \
-        --name klever-$node_name \
-        -v "$node_path/config:/opt/klever-blockchain/config/node" \
-        -v "$node_path/db:/opt/klever-blockchain/db" \
-        -v "$node_path/logs:/opt/klever-blockchain/logs" \
-        -v "$node_path/wallet:/opt/klever-blockchain/wallet" \
-        --network=host \
-        --entrypoint=/usr/local/bin/validator \
-        kleverapp/klever-go:latest \
-        '--log-save' '--use-log-view' "--rest-api-interface=0.0.0.0:$rest_api_port" \
-        "--display-name=$node_name" '--start-in-epoch' $redundancy > /dev/null 2>&1
-    
-    if [ $? -eq 0 ]; then
+    if start_node_container "klever-$node_name" "$node_path" "$rest_api_port" "$node_name" "$redundancy"; then
         echo -e "${GREEN}  ✓ Container started successfully${RESET}"
         echo -e "${GREEN}${BOLD}✓ Node $node_name created successfully!${RESET}"
         return 0
     else
         echo -e "${RED}✗ Failed to start Docker container.${RESET}"
+        cleanup_failed_node
         return 1
     fi
 }
@@ -452,63 +577,66 @@ module_create_nodes() {
 
     # Check for existing nodes first
     echo -e "${CYAN}Checking for existing Klever nodes...${RESET}"
-    local existing_nodes=$(find_node_directories 2>/dev/null)
-    
+    local existing_nodes
+    existing_nodes=$(find_node_directories 2>/dev/null)
+
     if [[ -n "$existing_nodes" ]]; then
         echo -e "${YELLOW}${BOLD}Existing nodes detected:${RESET}"
         echo
-        
+
         declare -a used_ports
         declare -a existing_node_names
-        
+
         while IFS= read -r line; do
-            local node_dir=$(echo "$line" | awk '{print $1}')
-            local container_name=$(echo "$line" | awk '{print $2}')
-            local node_name=$(basename "$node_dir")
-            
-            local params=$(extract_node_parameters "$container_name" "$node_name")
-            local rest_api_port=$(echo "$params" | cut -d'|' -f1)
-            local redundancy=$(echo "$params" | cut -d'|' -f2)
-            local status=$(get_container_status "$container_name")
-            
+            local node_dir
+            node_dir=$(echo "$line" | awk '{print $1}')
+            local container_name
+            container_name=$(echo "$line" | awk '{print $2}')
+            local node_name
+            node_name=$(basename "$node_dir")
+
+            local params
+            params=$(extract_node_parameters "$container_name" "$node_name")
+            local rest_api_port
+            rest_api_port=$(echo "$params" | cut -d'|' -f1)
+            local redundancy
+            redundancy=$(echo "$params" | cut -d'|' -f2)
+            local status
+            status=$(get_container_status "$container_name")
+
             used_ports+=("$rest_api_port")
             existing_node_names+=("$node_name")
-            
+
             if [ "$status" == "running" ]; then
                 echo -e "  ${GREEN}•${RESET} ${WHITE}$node_name${RESET} - Port: ${CYAN}$rest_api_port${RESET} - Status: ${GREEN}Running${RESET}"
             else
                 echo -e "  ${YELLOW}•${RESET} ${WHITE}$node_name${RESET} - Port: ${CYAN}$rest_api_port${RESET} - Status: ${RED}Stopped${RESET}"
             fi
-            
+
             if [[ "$redundancy" == "--redundancy-level=1" ]]; then
                 echo -e "    ${YELLOW}(Fallback Node)${RESET}"
             fi
         done <<< "$existing_nodes"
-        
+
         # Find next available port
         local max_port=8079
         for port in "${used_ports[@]}"; do
-            if [ $port -gt $max_port ]; then
+            if [ "$port" -gt "$max_port" ]; then
                 max_port=$port
             fi
         done
         local next_free_port=$((max_port + 1))
-        
+
         echo
         echo -e "${YELLOW}Used ports: ${WHITE}${used_ports[*]}${RESET}"
         echo -e "${YELLOW}Existing node names: ${WHITE}${existing_node_names[*]}${RESET}"
         echo
         echo -e "${CYAN}New nodes will automatically use the next available ports starting from ${WHITE}$next_free_port${CYAN}.${RESET}"
         echo
-        
-        while true; do
-            read -p $'\e[35mDo you want to continue creating additional nodes? (y/n): \e[0m' continue_create
-            if [[ "$continue_create" == "y" || "$continue_create" == "n" ]]; then
-                break
-            fi
-            echo -e "${RED}Please enter 'y' or 'n'.${RESET}"
-        done
-        
+
+        local continue_create
+        continue_create=$(confirm_yn "Do you want to continue creating additional nodes?")
+
         if [[ "$continue_create" == "n" ]]; then
             echo -e "${YELLOW}Node creation cancelled.${RESET}"
             press_any_key
@@ -526,7 +654,7 @@ module_create_nodes() {
     # Ask for installation directory
     read -p $'\e[35mEnter installation directory (default: /opt): \e[0m' base_path
     base_path=${base_path:-/opt}
-    
+
     if [ ! -d "$base_path" ]; then
         mkdir -p "$base_path"
         if [ $? -ne 0 ]; then
@@ -542,10 +670,19 @@ module_create_nodes() {
     check_docker_installed
     echo
 
+    # Select Docker image tag
+    select_docker_image_tag
+    echo
+
     # Pull Docker image
-    echo -e "${CYAN}Pulling latest Docker image...${RESET}"
-    (docker pull kleverapp/klever-go:latest > /dev/null 2>&1) &
-    show_spinner $! "Pulling kleverapp/klever-go:latest"
+    echo -e "${CYAN}Pulling Docker image...${RESET}"
+    (docker pull "kleverapp/klever-go:${DOCKER_IMAGE_TAG}" > /dev/null 2>&1) &
+    show_spinner $! "Pulling kleverapp/klever-go:${DOCKER_IMAGE_TAG}"
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}Failed to pull Docker image kleverapp/klever-go:${DOCKER_IMAGE_TAG}.${RESET}"
+        press_any_key
+        return 1
+    fi
     echo
 
     # Ask for number of nodes
@@ -564,36 +701,32 @@ module_create_nodes() {
     echo -e "${YELLOW}  • Normal nodes: Active validators (--redundancy-level not set)${RESET}"
     echo -e "${YELLOW}  • Fallback nodes: Backup validators (--redundancy-level=1)${RESET}"
     echo
-    while true; do
-        read -p $'\e[35mAre these fallback nodes? (y/n): \e[0m' fallback_choice
-        if [[ "$fallback_choice" == "y" || "$fallback_choice" == "n" ]]; then
-            break
-        fi
-        echo -e "${RED}Please enter 'y' or 'n'.${RESET}"
-    done
 
-    if [[ $fallback_choice == "y" ]]; then
+    local fallback_choice
+    fallback_choice=$(confirm_yn "Are these fallback nodes?")
+
+    local redundancy=""
+    local generate_keys=""
+
+    if [[ "$fallback_choice" == "y" ]]; then
         redundancy="--redundancy-level=1"
         generate_keys="n"
         echo -e "${CYAN}Fallback nodes will be created with redundancy level 1.${RESET}"
     else
         redundancy=""
         echo
-        while true; do
-            read -p $'\e[35mDo you need to generate new BLS validator keys? (y/n): \e[0m' generate_keys
-            if [[ "$generate_keys" == "y" || "$generate_keys" == "n" ]]; then
-                break
-            fi
-            echo -e "${RED}Please enter 'y' or 'n'.${RESET}"
-        done
+        generate_keys=$(confirm_yn "Do you need to generate new BLS validator keys?")
     fi
     echo
 
     # Find next available node number and port
-    local next_info=$(find_next_available_node "$base_path")
-    local next_node_num=$(echo "$next_info" | cut -d'|' -f1)
-    local next_port=$(echo "$next_info" | cut -d'|' -f2)
-    
+    local next_info
+    next_info=$(find_next_available_node "$base_path")
+    local next_node_num
+    next_node_num=$(echo "$next_info" | cut -d'|' -f1)
+    local next_port
+    next_port=$(echo "$next_info" | cut -d'|' -f2)
+
     local end_node_num=$((next_node_num + num_nodes - 1))
     local end_port=$((next_port + num_nodes - 1))
 
@@ -606,14 +739,9 @@ module_create_nodes() {
     echo -e "${CYAN}  • Node names: ${WHITE}node$next_node_num - node$end_node_num${RESET}"
     echo -e "${CYAN}  • REST API ports: ${WHITE}$next_port - $end_port${RESET}"
     echo
-    
-    while true; do
-        read -p $'\e[35mProceed with node creation? (y/n): \e[0m' confirm
-        if [[ "$confirm" == "y" || "$confirm" == "n" ]]; then
-            break
-        fi
-        echo -e "${RED}Please enter 'y' or 'n'.${RESET}"
-    done
+
+    local confirm
+    confirm=$(confirm_yn "Proceed with node creation?")
 
     if [[ "$confirm" == "n" ]]; then
         echo -e "${YELLOW}Node creation cancelled.${RESET}"
@@ -628,11 +756,11 @@ module_create_nodes() {
     # Create nodes with intelligent numbering and port assignment
     local success_count=0
     local fail_count=0
-    
-    for ((i=0; i<$num_nodes; i++)); do
+
+    for ((i=0; i<num_nodes; i++)); do
         local current_node_num=$((next_node_num + i))
         local current_port=$((next_port + i))
-        if create_node $current_node_num "$base_path" "$redundancy" "$generate_keys" $current_port; then
+        if create_node "$current_node_num" "$base_path" "$redundancy" "$generate_keys" "$current_port"; then
             ((success_count++))
         else
             ((fail_count++))
@@ -663,13 +791,13 @@ module_create_nodes() {
         echo -e "${YELLOW}Please ensure the 'validatorKey.pem' file is placed in each node's config directory.${RESET}"
         echo -e "${YELLOW}After placing the key, restart the node: ${WHITE}docker restart klever-node1${RESET}"
     fi
-    
+
     echo
     echo -e "${CYAN}${BOLD}Node Management Commands:${RESET}"
     echo -e "${WHITE}  • Stop a node:  ${CYAN}docker stop klever-node<number>${RESET}"
     echo -e "${WHITE}  • Start a node: ${CYAN}docker start klever-node<number>${RESET}"
     echo -e "${WHITE}  • View logs:    ${CYAN}docker logs -f --tail 50 klever-node<number>${RESET}"
-    
+
     press_any_key
 }
 
@@ -683,14 +811,18 @@ update_node() {
     local rest_api_port=$3
     local redundancy=$4
     local display_name=$5
-    local node_name=$(basename "$node_dir")
+    local node_name
+    node_name=$(basename "$node_dir")
 
     echo
     echo -e "${CYAN}${BOLD}Updating $node_name (container: $container_name)...${RESET}"
 
     # Download configuration
     echo -e "${CYAN}  Downloading latest configuration...${RESET}"
-    if ! curl -k -s -f -o /tmp/config_update_${node_name}.tar.gz "https://backup.mainnet.klever.org/config.mainnet.108.tar.gz" 2>/dev/null; then
+    local tmp_file
+    tmp_file=$(make_temp_file "config_update_${node_name}")
+    if ! curl -s -f -o "$tmp_file" "https://backup.mainnet.klever.org/config.mainnet.108.tar.gz" 2>/dev/null; then
+        rm -f "$tmp_file"
         echo -e "${RED}✗ Failed to download configuration file.${RESET}"
         return 1
     fi
@@ -698,12 +830,12 @@ update_node() {
 
     # Extract configuration
     echo -e "${CYAN}  Extracting configuration...${RESET}"
-    pushd "$node_dir" > /dev/null
-    tar -xzf /tmp/config_update_${node_name}.tar.gz --strip-components=1 -C ./config 2>/dev/null
+    pushd "$node_dir" > /dev/null || return 1
+    tar -xzf "$tmp_file" --strip-components=1 -C ./config 2>/dev/null
     local extract_status=$?
-    popd > /dev/null
-    rm -f /tmp/config_update_${node_name}.tar.gz
-    
+    popd > /dev/null || true
+    rm -f "$tmp_file"
+
     if [ $extract_status -ne 0 ]; then
         echo -e "${RED}✗ Failed to extract configuration.${RESET}"
         return 1
@@ -713,21 +845,16 @@ update_node() {
     # Stop and remove container
     if docker ps -a --format '{{.Names}}' | grep -q "^${container_name}$"; then
         echo -e "${CYAN}  Stopping container...${RESET}"
-        docker stop $container_name > /dev/null 2>&1
+        docker stop "$container_name" > /dev/null 2>&1
         echo -e "${GREEN}  ✓ Container stopped${RESET}"
-        
+
         echo -e "${CYAN}  Removing old container...${RESET}"
-        docker rm $container_name > /dev/null 2>&1
+        docker rm "$container_name" > /dev/null 2>&1
         echo -e "${GREEN}  ✓ Container removed${RESET}"
     fi
 
     # Fix permissions
     fix_node_permissions "$node_dir"
-
-    # Pull latest image
-    echo -e "${CYAN}  Pulling latest Docker image...${RESET}"
-    (docker pull kleverapp/klever-go:latest > /dev/null 2>&1) &
-    show_spinner $! "  Pulling kleverapp/klever-go:latest"
 
     # Start new container
     echo -e "${CYAN}  Starting new container...${RESET}"
@@ -738,22 +865,8 @@ update_node() {
         echo -e "${CYAN}    Redundancy: ${WHITE}None (Normal validator)${RESET}"
     fi
     echo -e "${CYAN}    Display Name: ${WHITE}$display_name${RESET}"
-    
-    docker run -it -d \
-        --restart unless-stopped \
-        --user "999:999" \
-        --name $container_name \
-        -v $node_dir/config:/opt/klever-blockchain/config/node \
-        -v $node_dir/db:/opt/klever-blockchain/db \
-        -v $node_dir/logs:/opt/klever-blockchain/logs \
-        -v $node_dir/wallet:/opt/klever-blockchain/wallet \
-        --network=host \
-        --entrypoint=/usr/local/bin/validator \
-        kleverapp/klever-go:latest \
-        '--log-save' '--use-log-view' "--rest-api-interface=0.0.0.0:$rest_api_port" \
-        "--display-name=$display_name" '--start-in-epoch' $redundancy > /dev/null 2>&1
 
-    if [ $? -eq 0 ]; then
+    if start_node_container "$container_name" "$node_dir" "$rest_api_port" "$display_name" "$redundancy"; then
         echo -e "${GREEN}  ✓ Container started${RESET}"
         echo -e "${GREEN}${BOLD}✓ Node $node_name updated successfully!${RESET}"
         return 0
@@ -770,15 +883,11 @@ module_update_nodes() {
     echo -e "${CYAN}${BOLD}═══════════════════════════════════════════════${RESET}"
     echo
 
-    # Check prerequisites
-    check_jq_installed
-    echo
-
     # Find nodes
     echo -e "${CYAN}Searching for Klever nodes...${RESET}"
     local node_info
     node_info=$(find_node_directories)
-    
+
     if [[ -z "$node_info" ]]; then
         echo -e "${RED}No Klever nodes found.${RESET}"
         echo -e "${YELLOW}Please create nodes first using option 1.${RESET}"
@@ -790,25 +899,32 @@ module_update_nodes() {
     declare -a nodes_to_update
     local fallback_count=0
     local normal_count=0
-    
+
     echo -e "${GREEN}Found Klever nodes:${RESET}"
     echo
 
     while IFS= read -r line; do
-        local node_dir=$(echo "$line" | awk '{print $1}')
-        local container_name=$(echo "$line" | awk '{print $2}')
-        local node_name=$(basename "$node_dir")
-        
-        local params=$(extract_node_parameters "$container_name" "$node_name")
-        local rest_api_port=$(echo "$params" | cut -d'|' -f1)
-        local redundancy=$(echo "$params" | cut -d'|' -f2)
-        local display_name=$(echo "$params" | cut -d'|' -f3)
-        
+        local node_dir
+        node_dir=$(echo "$line" | awk '{print $1}')
+        local container_name
+        container_name=$(echo "$line" | awk '{print $2}')
+        local node_name
+        node_name=$(basename "$node_dir")
+
+        local params
+        params=$(extract_node_parameters "$container_name" "$node_name")
+        local rest_api_port
+        rest_api_port=$(echo "$params" | cut -d'|' -f1)
+        local redundancy
+        redundancy=$(echo "$params" | cut -d'|' -f2)
+        local display_name
+        display_name=$(echo "$params" | cut -d'|' -f3)
+
         echo -e "${CYAN}${BOLD}Node: $node_name${RESET}"
         echo -e "${WHITE}  Path:          ${CYAN}$node_dir${RESET}"
         echo -e "${WHITE}  Container:     ${CYAN}$container_name${RESET}"
         echo -e "${WHITE}  REST API Port: ${CYAN}$rest_api_port${RESET}"
-        
+
         if [[ "$redundancy" == "--redundancy-level=1" ]]; then
             echo -e "${WHITE}  Type:          ${YELLOW}Fallback Node (redundancy-level=1)${RESET}"
             ((fallback_count++))
@@ -816,10 +932,10 @@ module_update_nodes() {
             echo -e "${WHITE}  Type:          ${GREEN}Normal Validator${RESET}"
             ((normal_count++))
         fi
-        
+
         echo -e "${WHITE}  Display Name:  ${CYAN}$display_name${RESET}"
         echo
-        
+
         nodes_to_update+=("$node_dir|$container_name|$rest_api_port|$redundancy|$display_name")
     done <<< "$node_info"
 
@@ -831,23 +947,64 @@ module_update_nodes() {
         echo
     fi
 
+    # Get current running version from first node
+    local first_container
+    first_container=$(echo "${nodes_to_update[0]}" | cut -d'|' -f2)
+    local current_version
+    current_version=$(get_node_version "$first_container")
+    local current_digest
+    current_digest=$(docker inspect "$first_container" --format='{{.Image}}' 2>/dev/null | cut -c1-19)
+
+    # Select Docker image tag
+    select_docker_image_tag
+    echo
+
+    # Pull image to check for updates
+    echo -e "${CYAN}Checking for image updates...${RESET}"
+    (docker pull "kleverapp/klever-go:${DOCKER_IMAGE_TAG}" > /dev/null 2>&1) &
+    show_spinner $! "Pulling kleverapp/klever-go:${DOCKER_IMAGE_TAG}"
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}Failed to pull Docker image kleverapp/klever-go:${DOCKER_IMAGE_TAG}.${RESET}"
+        echo -e "${YELLOW}Please verify the tag exists and try again.${RESET}"
+        press_any_key
+        return 1
+    fi
+    echo
+
+    local latest_version
+    latest_version=$(docker inspect "kleverapp/klever-go:${DOCKER_IMAGE_TAG}" --format='{{index .Config.Labels "org.opencontainers.image.version"}}' 2>/dev/null)
+    if [[ -z "$latest_version" || "$latest_version" == "<no value>" ]]; then
+        latest_version="unknown"
+    fi
+    local latest_digest
+    latest_digest=$(docker inspect "kleverapp/klever-go:${DOCKER_IMAGE_TAG}" --format='{{.Id}}' 2>/dev/null | cut -c1-19)
+
+    local image_changed="no"
+    if [[ "$current_digest" != "$latest_digest" ]]; then
+        image_changed="yes"
+    fi
+
     # Summary
     echo -e "${CYAN}${BOLD}Update Summary:${RESET}"
     echo -e "${WHITE}  • Total nodes to update: ${CYAN}${#nodes_to_update[@]}${RESET}"
     echo -e "${WHITE}  • Normal validators:     ${GREEN}$normal_count${RESET}"
     echo -e "${WHITE}  • Fallback nodes:        ${YELLOW}$fallback_count${RESET}"
     echo -e "${WHITE}  • Configuration source:  ${CYAN}https://backup.mainnet.klever.org/config.mainnet.108.tar.gz${RESET}"
-    echo -e "${WHITE}  • Docker image:          ${CYAN}kleverapp/klever-go:latest${RESET}"
+    echo -e "${WHITE}  • Docker image:          ${CYAN}kleverapp/klever-go:${DOCKER_IMAGE_TAG}${RESET}"
+    echo
+    echo -e "${WHITE}  • Running version:       ${CYAN}$current_version${RESET}"
+    echo -e "${WHITE}  • Target version:        ${CYAN}$latest_version${RESET}"
+    if [[ "$image_changed" == "yes" ]]; then
+        echo -e "  ${GREEN}${BOLD}  ↑ New image available!${RESET}"
+    else
+        echo -e "  ${YELLOW}  ✓ Image is already up to date${RESET}"
+    fi
+    echo -e "${WHITE}  • Config will be refreshed from latest source${RESET}"
     echo
 
     # Confirm
-    while true; do
-        read -p $'\e[35mProceed with the update? (y/n): \e[0m' confirm
-        if [[ "$confirm" == "y" || "$confirm" == "n" ]]; then
-            break
-        fi
-        echo -e "${RED}Please enter 'y' or 'n'.${RESET}"
-    done
+    local confirm
+    confirm=$(confirm_yn "Proceed with the update?")
 
     if [[ "$confirm" == "n" ]]; then
         echo -e "${YELLOW}Update cancelled.${RESET}"
@@ -861,14 +1018,19 @@ module_update_nodes() {
     # Update nodes
     local success_count=0
     local fail_count=0
-    
+
     for node in "${nodes_to_update[@]}"; do
-        local node_dir=$(echo "$node" | cut -d'|' -f1)
-        local container_name=$(echo "$node" | cut -d'|' -f2)
-        local rest_api_port=$(echo "$node" | cut -d'|' -f3)
-        local redundancy=$(echo "$node" | cut -d'|' -f4)
-        local display_name=$(echo "$node" | cut -d'|' -f5)
-        
+        local node_dir
+        node_dir=$(echo "$node" | cut -d'|' -f1)
+        local container_name
+        container_name=$(echo "$node" | cut -d'|' -f2)
+        local rest_api_port
+        rest_api_port=$(echo "$node" | cut -d'|' -f3)
+        local redundancy
+        redundancy=$(echo "$node" | cut -d'|' -f4)
+        local display_name
+        display_name=$(echo "$node" | cut -d'|' -f5)
+
         if update_node "$node_dir" "$container_name" "$rest_api_port" "$redundancy" "$display_name"; then
             ((success_count++))
         else
@@ -901,11 +1063,12 @@ extract_bls_key() {
     fi
 
     # Extract BLS key from header: "-----BEGIN PRIVATE KEY for [BLSKEY]-----"
-    local bls_key=$(grep -oP '(?<=-----BEGIN PRIVATE KEY for ).*(?=-----)' "$pem_file" 2>/dev/null)
+    local bls_key
+    bls_key=$(sed -n 's/.*BEGIN PRIVATE KEY for \(.*\)-----.*/\1/p' "$pem_file" 2>/dev/null | tr -d '[:space:]')
 
     if [ -z "$bls_key" ]; then
         # Try alternative format with brackets
-        bls_key=$(grep -oP '(?<=\[)[^\]]+(?=\])' "$pem_file" 2>/dev/null | head -1)
+        bls_key=$(sed -n 's/.*\[\([^]]*\)\].*/\1/p' "$pem_file" 2>/dev/null | head -1)
     fi
 
     echo "$bls_key"
@@ -918,7 +1081,8 @@ display_bls_keys() {
     echo -e "${CYAN}${BOLD}═══════════════════════════════════════════════${RESET}"
     echo
 
-    local node_info=$(find_node_directories)
+    local node_info
+    node_info=$(find_node_directories)
 
     if [[ -z "$node_info" ]]; then
         echo -e "${RED}No Klever nodes found.${RESET}"
@@ -934,9 +1098,12 @@ display_bls_keys() {
     local missing_keys=0
 
     while IFS= read -r line; do
-        local node_dir=$(echo "$line" | awk '{print $1}')
-        local container_name=$(echo "$line" | awk '{print $2}')
-        local node_name=$(basename "$node_dir")
+        local node_dir
+        node_dir=$(echo "$line" | awk '{print $1}')
+        local container_name
+        container_name=$(echo "$line" | awk '{print $2}')
+        local node_name
+        node_name=$(basename "$node_dir")
         local pem_file="$node_dir/config/validatorKey.pem"
 
         echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
@@ -945,7 +1112,8 @@ display_bls_keys() {
         echo
 
         if [ -f "$pem_file" ]; then
-            local bls_key=$(extract_bls_key "$pem_file")
+            local bls_key
+            bls_key=$(extract_bls_key "$pem_file")
 
             if [ -n "$bls_key" ]; then
                 echo -e "${GREEN}${BOLD}BLS Public Key:${RESET}"
@@ -991,21 +1159,66 @@ get_container_status() {
     fi
 }
 
+get_node_version() {
+    local container_name=$1
+    local version
+    version=$(docker inspect "$container_name" --format='{{index .Config.Labels "org.opencontainers.image.version"}}' 2>/dev/null)
+    if [[ -z "$version" || "$version" == "<no value>" ]]; then
+        echo "-"
+    else
+        echo "$version"
+    fi
+}
+
+get_node_sync_status() {
+    local rest_api_port=$1
+    local response
+    response=$(curl -s --connect-timeout 2 --max-time 3 "http://127.0.0.1:${rest_api_port}/node/status" 2>/dev/null)
+
+    if [[ -z "$response" ]]; then
+        echo "-|-"
+        return
+    fi
+
+    local nonce
+    nonce=$(echo "$response" | jq -r '.data.metrics.klv_nonce // empty' 2>/dev/null)
+    local is_syncing
+    is_syncing=$(echo "$response" | jq -r '.data.metrics.klv_is_syncing // empty' 2>/dev/null)
+
+    if [[ -z "$nonce" ]]; then
+        echo "-|-"
+        return
+    fi
+
+    local sync_label
+    if [[ "$is_syncing" == "0" ]]; then
+        sync_label="Synced"
+    else
+        sync_label="Syncing"
+    fi
+
+    echo "${nonce}|${sync_label}"
+}
+
 get_container_uptime() {
     local container_name=$1
-    local status=$(docker inspect --format='{{.State.Status}}' "$container_name" 2>/dev/null)
-    
+    local status
+    status=$(docker inspect --format='{{.State.Status}}' "$container_name" 2>/dev/null)
+
     if [ "$status" == "running" ]; then
-        local started=$(docker inspect --format='{{.State.StartedAt}}' "$container_name" 2>/dev/null)
+        local started
+        started=$(docker inspect --format='{{.State.StartedAt}}' "$container_name" 2>/dev/null)
         if [ -n "$started" ]; then
-            local start_epoch=$(date -d "$started" +%s 2>/dev/null)
-            local now_epoch=$(date +%s)
+            local start_epoch
+            start_epoch=$(date -d "$started" +%s 2>/dev/null)
+            local now_epoch
+            now_epoch=$(date +%s)
             local diff=$((now_epoch - start_epoch))
-            
+
             local days=$((diff / 86400))
             local hours=$(( (diff % 86400) / 3600 ))
             local minutes=$(( (diff % 3600) / 60 ))
-            
+
             if [ $days -gt 0 ]; then
                 echo "${days}d ${hours}h"
             elif [ $hours -gt 0 ]; then
@@ -1022,47 +1235,83 @@ get_container_uptime() {
 }
 
 display_nodes_status() {
-    local node_info=$(find_node_directories)
-    
+    local node_info
+    node_info=$(find_node_directories)
+
+    echo -e "${CYAN}${BOLD}══════════════════════════════════════════════════════════════════════════════════════${RESET}"
+    echo -e "${CYAN}${BOLD}                                      MANAGE KLEVER NODES                                        ${RESET}"
+    echo -e "${CYAN}${BOLD}═══════════════════════════════════════════════════════════════════════════════════════════════════${RESET}"
+
     if [[ -z "$node_info" ]]; then
-        echo -e "${RED}No Klever nodes found.${RESET}"
+        echo
+        echo -e "${RED}  No Klever nodes found.${RESET}"
+        echo
+        echo -e "${CYAN}${BOLD}═══════════════════════════════════════════════════════════════════════════════════════════════════${RESET}"
         return 1
     fi
 
-    echo -e "${CYAN}${BOLD}═══════════════════════════════════════════════════════════════${RESET}"
-    printf "${CYAN}${BOLD}%-20s %-10s %-8s %-10s${RESET}\n" "Node Name" "Status" "Port" "Uptime"
-    echo -e "${CYAN}${BOLD}═══════════════════════════════════════════════════════════════${RESET}"
-    
+    printf "${CYAN}${BOLD}  %-13s %-10s %-6s %-24s %-10s %-12s %-10s${RESET}\n" "Node" "Status" "Port" "Version" "Uptime" "Nonce" "Sync"
+    echo -e "${CYAN}  ─────────────────────────────────────────────────────────────────────────────────────────────────${RESET}"
+
     while IFS= read -r line; do
-        local node_dir=$(echo "$line" | awk '{print $1}')
-        local container_name=$(echo "$line" | awk '{print $2}')
-        local node_name=$(basename "$node_dir")
-        
-        local params=$(extract_node_parameters "$container_name" "$node_name")
-        local rest_api_port=$(echo "$params" | cut -d'|' -f1)
-        
-        local status=$(get_container_status "$container_name")
-        local uptime=$(get_container_uptime "$container_name")
-        
+        local node_dir
+        node_dir=$(echo "$line" | awk '{print $1}')
+        local container_name
+        container_name=$(echo "$line" | awk '{print $2}')
+        local node_name
+        node_name=$(basename "$node_dir")
+
+        local params
+        params=$(extract_node_parameters "$container_name" "$node_name")
+        local rest_api_port
+        rest_api_port=$(echo "$params" | cut -d'|' -f1)
+
+        local status
+        status=$(get_container_status "$container_name")
+        local uptime
+        uptime=$(get_container_uptime "$container_name")
+        local version
+        version=$(get_node_version "$container_name")
+
+        local nonce="--"
+        local sync_label="--"
+
         if [ "$status" == "running" ]; then
-            printf "${GREEN}%-20s${RESET} ${GREEN}%-10s${RESET} ${CYAN}%-8s${RESET} ${WHITE}%-10s${RESET}\n" \
-                "$node_name" "Running" "$rest_api_port" "$uptime"
+            local sync_info
+            sync_info=$(get_node_sync_status "$rest_api_port")
+            nonce=$(echo "$sync_info" | cut -d'|' -f1)
+            sync_label=$(echo "$sync_info" | cut -d'|' -f2)
+
+            local sync_color="${GREEN}"
+            if [ "$sync_label" == "Syncing" ]; then
+                sync_color="${YELLOW}"
+            elif [ "$sync_label" == "-" ]; then
+                nonce="--"
+                sync_label="--"
+                sync_color="${WHITE}"
+            fi
+
+            printf "  ${GREEN}%-13s${RESET} ${GREEN}%-10s${RESET} ${CYAN}%-6s${RESET} ${WHITE}%-24s${RESET} ${WHITE}%-10s${RESET} ${WHITE}%-12s${RESET} ${sync_color}%-10s${RESET}\n" \
+                "$node_name" "Running" "$rest_api_port" "$version" "$uptime" "$nonce" "$sync_label"
         elif [ "$status" == "stopped" ]; then
-            printf "${YELLOW}%-20s${RESET} ${RED}%-10s${RESET} ${CYAN}%-8s${RESET} ${WHITE}%-10s${RESET}\n" \
-                "$node_name" "Stopped" "$rest_api_port" "-"
+            printf "  ${YELLOW}%-13s${RESET} ${RED}%-10s${RESET} ${CYAN}%-6s${RESET} ${WHITE}%-24s${RESET} ${WHITE}%-10s${RESET} ${WHITE}%-12s${RESET} ${WHITE}%-10s${RESET}\n" \
+                "$node_name" "Stopped" "$rest_api_port" "$version" "--" "--" "--"
         else
-            printf "${RED}%-20s${RESET} ${RED}%-10s${RESET} ${CYAN}%-8s${RESET} ${WHITE}%-10s${RESET}\n" \
-                "$node_name" "Not Found" "$rest_api_port" "-"
+            printf "  ${RED}%-13s${RESET} ${RED}%-10s${RESET} ${CYAN}%-6s${RESET} ${WHITE}%-24s${RESET} ${WHITE}%-10s${RESET} ${WHITE}%-12s${RESET} ${WHITE}%-10s${RESET}\n" \
+                "$node_name" "Not Found" "$rest_api_port" "--" "--" "--" "--"
         fi
     done <<< "$node_info"
-    
-    echo -e "${CYAN}${BOLD}═══════════════════════════════════════════════════════════════${RESET}"
+
+    echo -e "${CYAN}${BOLD}═══════════════════════════════════════════════════════════════════════════════════════════════════${RESET}"
 }
 
-select_nodes_interactive() {
-    local action=$1
-    local node_info=$(find_node_directories)
-    
+# Display numbered list of nodes. Populates the MENU_CONTAINERS array.
+# Returns 1 if no nodes found.
+MENU_CONTAINERS=()
+list_nodes_menu() {
+    local node_info
+    node_info=$(find_node_directories)
+
     if [[ -z "$node_info" ]]; then
         echo -e "${RED}No Klever nodes found.${RESET}"
         return 1
@@ -1071,103 +1320,85 @@ select_nodes_interactive() {
     echo
     echo -e "${CYAN}${BOLD}Available nodes:${RESET}"
     echo
-    
-    declare -a containers
+
+    MENU_CONTAINERS=()
     local index=1
-    
+
     while IFS= read -r line; do
-        local node_dir=$(echo "$line" | awk '{print $1}')
-        local container_name=$(echo "$line" | awk '{print $2}')
-        local node_name=$(basename "$node_dir")
-        local status=$(get_container_status "$container_name")
-        
+        local node_dir
+        node_dir=$(echo "$line" | awk '{print $1}')
+        local container_name
+        container_name=$(echo "$line" | awk '{print $2}')
+        local node_name
+        node_name=$(basename "$node_dir")
+        local status
+        status=$(get_container_status "$container_name")
+
         if [ "$status" == "running" ]; then
             echo -e "  ${GREEN}[$index]${RESET} ${WHITE}$node_name${RESET} (${GREEN}Running${RESET})"
         else
             echo -e "  ${YELLOW}[$index]${RESET} ${WHITE}$node_name${RESET} (${RED}Stopped${RESET})"
         fi
-        
-        containers+=("$container_name")
+
+        MENU_CONTAINERS+=("$container_name")
         ((index++))
     done <<< "$node_info"
-    
+}
+
+select_nodes_interactive() {
+    local action=$1
+
+    if ! list_nodes_menu; then
+        return 1
+    fi
+
     echo
     echo -e "  ${CYAN}[a]${RESET} All nodes"
     echo -e "  ${CYAN}[b]${RESET} Back to menu"
     echo
-    
+
     while true; do
         read -p $'\e[35mSelect option: \e[0m' choice
-        
+
         if [[ "$choice" == "b" ]]; then
             return 0
         elif [[ "$choice" == "a" ]]; then
             echo
-            for container in "${containers[@]}"; do
+            for container in "${MENU_CONTAINERS[@]}"; do
                 case $action in
-                    "start")
-                        echo -e "${CYAN}Starting $container...${RESET}"
-                        docker start "$container" > /dev/null 2>&1
-                        if [ $? -eq 0 ]; then
-                            echo -e "${GREEN}✓ $container started${RESET}"
-                        else
-                            echo -e "${RED}✗ Failed to start $container${RESET}"
-                        fi
-                        ;;
-                    "stop")
-                        echo -e "${CYAN}Stopping $container...${RESET}"
-                        docker stop "$container" > /dev/null 2>&1
-                        if [ $? -eq 0 ]; then
-                            echo -e "${GREEN}✓ $container stopped${RESET}"
-                        else
-                            echo -e "${RED}✗ Failed to stop $container${RESET}"
-                        fi
-                        ;;
-                    "restart")
-                        echo -e "${CYAN}Restarting $container...${RESET}"
-                        docker restart "$container" > /dev/null 2>&1
-                        if [ $? -eq 0 ]; then
-                            echo -e "${GREEN}✓ $container restarted${RESET}"
-                        else
-                            echo -e "${RED}✗ Failed to restart $container${RESET}"
-                        fi
-                        ;;
+                    start)   echo -e "${CYAN}Starting $container...${RESET}" ;;
+                    stop)    echo -e "${CYAN}Stopping $container...${RESET}" ;;
+                    restart) echo -e "${CYAN}Restarting $container...${RESET}" ;;
                 esac
+                if docker "$action" "$container" > /dev/null 2>&1; then
+                    case $action in
+                        start)   echo -e "${GREEN}✓ $container started${RESET}" ;;
+                        stop)    echo -e "${GREEN}✓ $container stopped${RESET}" ;;
+                        restart) echo -e "${GREEN}✓ $container restarted${RESET}" ;;
+                    esac
+                else
+                    echo -e "${RED}✗ Failed to $action $container${RESET}"
+                fi
             done
             echo
             break
-        elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#containers[@]}" ]; then
-            local selected_container="${containers[$((choice-1))]}"
+        elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#MENU_CONTAINERS[@]}" ]; then
+            local selected_container="${MENU_CONTAINERS[$((choice-1))]}"
             echo
             case $action in
-                "start")
-                    echo -e "${CYAN}Starting $selected_container...${RESET}"
-                    docker start "$selected_container" > /dev/null 2>&1
-                    if [ $? -eq 0 ]; then
-                        echo -e "${GREEN}✓ $selected_container started successfully${RESET}"
-                    else
-                        echo -e "${RED}✗ Failed to start $selected_container${RESET}"
-                    fi
-                    ;;
-                "stop")
-                    echo -e "${CYAN}Stopping $selected_container...${RESET}"
-                    docker stop "$selected_container" > /dev/null 2>&1
-                    if [ $? -eq 0 ]; then
-                        echo -e "${GREEN}✓ $selected_container stopped successfully${RESET}"
-                    else
-                        echo -e "${RED}✗ Failed to stop $selected_container${RESET}"
-                    fi
-                    ;;
-                "restart")
-                    echo -e "${CYAN}Restarting $selected_container...${RESET}"
-                    docker restart "$selected_container" > /dev/null 2>&1
-                    if [ $? -eq 0 ]; then
-                        echo -e "${GREEN}✓ $selected_container restarted successfully${RESET}"
-                    else
-                        echo -e "${RED}✗ Failed to restart $selected_container${RESET}"
-                    fi
-                    ;;
+                start)   echo -e "${CYAN}Starting $selected_container...${RESET}" ;;
+                stop)    echo -e "${CYAN}Stopping $selected_container...${RESET}" ;;
+                restart) echo -e "${CYAN}Restarting $selected_container...${RESET}" ;;
             esac
+            if docker "$action" "$selected_container" > /dev/null 2>&1; then
+                case $action in
+                    start)   echo -e "${GREEN}✓ $selected_container started successfully${RESET}" ;;
+                    stop)    echo -e "${GREEN}✓ $selected_container stopped successfully${RESET}" ;;
+                    restart) echo -e "${GREEN}✓ $selected_container restarted successfully${RESET}" ;;
+                esac
+            else
+                echo -e "${RED}✗ Failed to $action $selected_container${RESET}"
+            fi
             echo
             break
         else
@@ -1177,48 +1408,22 @@ select_nodes_interactive() {
 }
 
 view_node_logs() {
-    local node_info=$(find_node_directories)
-    
-    if [[ -z "$node_info" ]]; then
-        echo -e "${RED}No Klever nodes found.${RESET}"
+    if ! list_nodes_menu; then
         press_any_key
         return 1
     fi
 
     echo
-    echo -e "${CYAN}${BOLD}Select node to view logs:${RESET}"
-    echo
-    
-    declare -a containers
-    local index=1
-    
-    while IFS= read -r line; do
-        local node_dir=$(echo "$line" | awk '{print $1}')
-        local container_name=$(echo "$line" | awk '{print $2}')
-        local node_name=$(basename "$node_dir")
-        local status=$(get_container_status "$container_name")
-        
-        if [ "$status" == "running" ]; then
-            echo -e "  ${GREEN}[$index]${RESET} ${WHITE}$node_name${RESET} (${GREEN}Running${RESET})"
-        else
-            echo -e "  ${YELLOW}[$index]${RESET} ${WHITE}$node_name${RESET} (${RED}Stopped${RESET})"
-        fi
-        
-        containers+=("$container_name")
-        ((index++))
-    done <<< "$node_info"
-    
-    echo
     echo -e "  ${CYAN}[b]${RESET} Back to menu"
     echo
-    
+
     while true; do
         read -p $'\e[35mSelect node: \e[0m' choice
-        
+
         if [[ "$choice" == "b" ]]; then
             return 0
-        elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#containers[@]}" ]; then
-            local selected_container="${containers[$((choice-1))]}"
+        elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#MENU_CONTAINERS[@]}" ]; then
+            local selected_container="${MENU_CONTAINERS[$((choice-1))]}"
             echo
             echo -e "${CYAN}Viewing logs for $selected_container (press Ctrl+C to exit)...${RESET}"
             sleep 2
@@ -1233,27 +1438,19 @@ view_node_logs() {
 module_manage_nodes() {
     while true; do
         display_header
-        echo -e "${CYAN}${BOLD}═══════════════════════════════════════════════${RESET}"
-        echo -e "${CYAN}${BOLD}              MANAGE KLEVER NODES              ${RESET}"
-        echo -e "${CYAN}${BOLD}═══════════════════════════════════════════════${RESET}"
-        echo
-        
+
         display_nodes_status
-        
+
         echo
-        echo -e "${CYAN}${BOLD}Management Options:${RESET}"
-        echo -e "  ${GREEN}[1]${RESET} Start Nodes"
-        echo -e "  ${GREEN}[2]${RESET} Stop Nodes"
-        echo -e "  ${GREEN}[3]${RESET} Restart Nodes"
-        echo -e "  ${GREEN}[4]${RESET} View Node Logs"
-        echo -e "  ${GREEN}[5]${RESET} Refresh Status"
-        echo -e "  ${GREEN}[6]${RESET} Fix Node Permissions"
-        echo -e "  ${GREEN}[7]${RESET} Extract BLS Public Keys"
-        echo -e "  ${CYAN}[b]${RESET} Back to Main Menu"
+        echo -e "${CYAN}${BOLD}Options:${RESET}"
+        echo -e "  ${GREEN}[1]${RESET} Start Nodes          ${GREEN}[5]${RESET} Refresh Status"
+        echo -e "  ${GREEN}[2]${RESET} Stop Nodes           ${GREEN}[6]${RESET} Fix Node Permissions"
+        echo -e "  ${GREEN}[3]${RESET} Restart Nodes        ${GREEN}[7]${RESET} Extract BLS Public Keys"
+        echo -e "  ${GREEN}[4]${RESET} View Node Logs       ${CYAN}[b]${RESET} Back to Main Menu"
         echo
-        
+
         read -p $'\e[35mSelect option: \e[0m' choice
-        
+
         case $choice in
             1)
                 display_header
@@ -1286,12 +1483,14 @@ module_manage_nodes() {
                 display_header
                 echo -e "${CYAN}${BOLD}FIX NODE PERMISSIONS${RESET}"
                 echo
-                local node_info=$(find_node_directories)
+                local node_info
+                node_info=$(find_node_directories)
                 if [[ -z "$node_info" ]]; then
                     echo -e "${RED}No Klever nodes found.${RESET}"
                 else
                     while IFS= read -r line; do
-                        local node_dir=$(echo "$line" | awk '{print $1}')
+                        local node_dir
+                        node_dir=$(echo "$line" | awk '{print $1}')
                         fix_node_permissions "$node_dir"
                         echo
                     done <<< "$node_info"
@@ -1327,9 +1526,9 @@ main_menu() {
         echo -e "  ${GREEN}[3]${RESET} Manage Nodes (Start/Stop/Status)"
         echo -e "  ${RED}[4]${RESET} Exit"
         echo
-        
+
         read -p $'\e[35mEnter your choice [1-4]: \e[0m' choice
-        
+
         case $choice in
             1)
                 module_create_nodes
@@ -1359,11 +1558,41 @@ main_menu() {
 # SCRIPT ENTRY POINT
 ################################################################################
 
+# Handle command-line arguments
+case "${1:-}" in
+    --help|-h)
+        echo "Klever Node Management Suite v${VERSION}"
+        echo ""
+        echo "Usage: sudo $0 [OPTIONS]"
+        echo ""
+        echo "Options:"
+        echo "  --help, -h       Show this help message"
+        echo "  --version, -v    Show version number"
+        echo ""
+        echo "One-line install:"
+        echo "  curl -sSL https://raw.githubusercontent.com/CTJaeger/KleverNodeManagement/main/klever_node_manager.sh | sudo bash"
+        echo ""
+        echo "This script must be run as root or with sudo."
+        exit 0
+        ;;
+    --version|-v)
+        echo "Klever Node Management Suite v${VERSION}"
+        exit 0
+        ;;
+esac
+
+# When piped via stdin (curl | bash), redirect stdin to the terminal so
+# interactive prompts work. Only do this when /dev/tty is available and
+# the script itself is being read from stdin (i.e., not a regular file).
+if [ ! -t 0 ] && [ -c /dev/tty ] && [ -z "${BASH_SOURCE[0]:-}" ]; then
+    exec </dev/tty
+fi
+
 # Check root privileges
 check_root
 
-# Install bc for progress calculations
-check_bc_installed
+# Ensure jq is available (required for node discovery)
+check_jq_installed
 
 # Start main menu
 main_menu
