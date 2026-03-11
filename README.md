@@ -1,5 +1,7 @@
 # Klever Node Management Suite
 
+[![CI](https://github.com/CTJaeger/KleverNodeManagement/actions/workflows/ci.yml/badge.svg)](https://github.com/CTJaeger/KleverNodeManagement/actions/workflows/ci.yml)
+
 **An all-in-one solution for managing Klever validator nodes**
 
 ---
@@ -23,11 +25,15 @@ This script provides a unified interface for creating, updating, and managing Kl
 ### Key Features
 
 * **Create Nodes**: Automated setup with intelligent port assignment
-* **Update Nodes**: Safe updates preserving all blockchain data
+* **Update Nodes**: Safe updates preserving all blockchain data, with version comparison
 * **Manage Nodes**: Start, stop, restart, and monitor node status
+* **Monitoring Dashboard**: Real-time view of Version, Nonce, and Sync status per node
+* **Docker Image Tag Selector**: Choose specific Docker image versions from Docker Hub
 * **Extract BLS Keys**: Easy extraction of BLS Public Keys for validator registration
 * **Safety First**: Automatic detection of existing nodes to prevent data loss
 * **Smart Detection**: Finds next available node numbers and ports automatically
+* **CLI Flags**: `--help` and `--version` for quick info
+* **CI/CD**: Automated ShellCheck and syntax validation via GitHub Actions
 
 ---
 
@@ -59,6 +65,13 @@ chmod +x klever_node_manager.sh
 sudo ./klever_node_manager.sh
 ```
 
+### CLI Options
+
+```bash
+sudo ./klever_node_manager.sh --help      # Show help message
+sudo ./klever_node_manager.sh --version   # Show version number
+```
+
 ---
 
 ## 📖 Usage Guide
@@ -87,6 +100,25 @@ Enter your choice [1-4]: _
 
 ## 1️⃣ Creating New Nodes
 
+### Docker Image Tag Selection
+
+When creating nodes, you can choose which Docker image version to use:
+
+```
+Fetching available image tags...
+
+Available image tags:
+
+  [ 1] latest                         (default)
+  [ 2] v0.8.2
+  [ 3] v0.8.1
+  ...
+
+Select tag number or type custom tag [latest]: _
+```
+
+The script fetches available tags directly from Docker Hub, filtering out dev/testnet/devnet images.
+
 ### Scenario: First Installation (No Existing Nodes)
 
 **Step-by-step example:**
@@ -106,8 +138,8 @@ Installation directory: /opt
 
 Docker is already installed.
 
-Pulling latest Docker image...
-Pulling kleverapp/klever-go:latest ✓
+Fetching available image tags...
+[... tag selection ...]
 
 How many nodes do you want to create? 3
 
@@ -123,6 +155,7 @@ Summary:
   • Installation path: /opt
   • Number of nodes: 3
   • Node type: Normal (active validator)
+  • Docker image: kleverapp/klever-go:latest
   • Generate new keys: Yes
   • Node names: node1 - node3
   • REST API ports: 8080 - 8082
@@ -150,13 +183,7 @@ All permissions set correctly for node1.
   ✓ Container started successfully
 ✓ Node node1 created successfully!
 
-Creating node2...
-  [... similar output ...]
-✓ Node node2 created successfully!
-
-Creating node3...
-  [... similar output ...]
-✓ Node node3 created successfully!
+[... similar output for node2 and node3 ...]
 
 ═══════════════════════════════════════════════
 Node Creation Summary:
@@ -166,13 +193,6 @@ Node Creation Summary:
 ⚠ IMPORTANT:
 New 'validatorKey.pem' files have been generated in each node's config directory.
 Please ensure these keys are backed up securely!
-
-Node Management Commands:
-  • Stop a node:  docker stop klever-node<number>
-  • Start a node: docker start klever-node<number>
-  • View logs:    docker logs -f --tail 50 klever-node<number>
-
-Press any key to continue...
 ```
 
 ### Scenario: Adding More Nodes (Existing Nodes Present)
@@ -180,8 +200,6 @@ Press any key to continue...
 If you already have nodes running, the script detects them:
 
 ```
-Select option: 1
-
 Checking for existing Klever nodes...
 Existing nodes detected:
 
@@ -195,29 +213,6 @@ Existing node names: node1 node2 node3
 New nodes will automatically use the next available ports starting from 8083.
 
 Do you want to continue creating additional nodes? (y/n): y
-
-Enter installation directory (default: /opt): /opt
-Installation directory: /opt
-
-How many nodes do you want to create? 2
-
-Are these fallback nodes? (y/n): y
-
-Summary:
-  • Installation path: /opt
-  • Number of nodes: 2
-  • Node type: Fallback (redundancy-level=1)
-  • Generate new keys: No
-  • Node names: node4 - node5
-  • REST API ports: 8083 - 8084
-
-Proceed with node creation? (y/n): y
-
-[... creates node4 and node5 ...]
-
-⚠ IMPORTANT:
-Please ensure the 'validatorKey.pem' file is placed in each fallback node's config directory.
-After placing the key, restart the node with docker restart klever-node4
 ```
 
 **Important Notes:**
@@ -231,7 +226,7 @@ After placing the key, restart the node with docker restart klever-node4
 
 ## 2️⃣ Updating Existing Nodes
 
-This option updates all your nodes to the latest Klever configuration and Docker image.
+This option updates all your nodes to the latest Klever configuration and Docker image. The update flow includes **version comparison** so you can see whether an update is actually available before proceeding.
 
 **Example update session:**
 
@@ -242,8 +237,6 @@ Select option: 2
          UPDATE EXISTING KLEVER NODES
 ═══════════════════════════════════════════════
 
-jq is already installed.
-
 Searching for Klever nodes...
 Found Klever nodes:
 
@@ -252,21 +245,14 @@ Node: node1
   Container:     klever-node1
   REST API Port: 8080
   Type:          Normal Validator
-  Display Name:  node1
 
-Node: node2
-  Path:          /opt/node2
-  Container:     klever-node2
-  REST API Port: 8081
-  Type:          Fallback Node (redundancy-level=1)
-  Display Name:  node2
+[... similar output for other nodes ...]
 
-Node: node3
-  Path:          /opt/node3
-  Container:     klever-node3
-  REST API Port: 8082
-  Type:          Normal Validator
-  Display Name:  node3
+Fetching available image tags...
+[... tag selection ...]
+
+Checking for image updates...
+Pulling kleverapp/klever-go:latest ✓
 
 Update Summary:
   • Total nodes to update: 3
@@ -275,48 +261,25 @@ Update Summary:
   • Configuration source:  https://backup.mainnet.klever.org/config.mainnet.108.tar.gz
   • Docker image:          kleverapp/klever-go:latest
 
+  • Running version:       v0.8.1
+  • Target version:        v0.8.2
+    ↑ New image available!
+  • Config will be refreshed from latest source
+
 Proceed with the update? (y/n): y
 
-Starting update process...
-
-Updating node1 (container: klever-node1)...
-  Downloading latest configuration...
-  ✓ Configuration downloaded
-  Extracting configuration...
-  ✓ Configuration extracted
-  Stopping container...
-  ✓ Container stopped
-  Removing old container...
-  ✓ Container removed
-Fixing permissions for node1...
-  ✓ config permissions correct (999:999)
-  ✓ db permissions correct (999:999)
-  ✓ logs permissions correct (999:999)
-  ✓ wallet permissions correct (999:999)
-All permissions set correctly for node1.
-  Pulling latest Docker image...
-  Pulling kleverapp/klever-go:latest ✓
-  Starting new container with parameters:
-    REST API Port: 0.0.0.0:8080
-    Redundancy Level: None (Normal validator)
-    Display Name: node1
-  ✓ Container started
-✓ Node node1 updated successfully!
-
-[... similar output for node2 and node3 ...]
+[... update process for each node ...]
 
 ═══════════════════════════════════════════════
 Update Summary:
   ✓ Successfully updated: 3
 ═══════════════════════════════════════════════
-
-Press any key to continue...
 ```
 
 **What Gets Updated:**
 
 * Configuration files in `/config/` directory
-* Docker image to latest version
+* Docker image to selected version
 * Container restart with preserved settings
 
 **What Is NOT Changed:**
@@ -333,39 +296,38 @@ Press any key to continue...
 
 ## 3️⃣ Managing Nodes
 
-This menu provides tools for daily node management.
+This menu provides tools for daily node management with a **real-time monitoring dashboard**.
 
-### Status Overview
+### Monitoring Dashboard
+
+The status overview shows **Version**, **Nonce**, and **Sync** status for each node:
 
 ```
 Select option: 3
 
-═══════════════════════════════════════════════
-              MANAGE KLEVER NODES
-═══════════════════════════════════════════════
+══════════════════════════════════════════════════════════════════════════════
+                              MANAGE KLEVER NODES
+═══════════════════════════════════════════════════════════════════════════════
 
-═══════════════════════════════════════════════════════════════
-Node Name            Status     Port     Uptime
-═══════════════════════════════════════════════════════════════
-node1                Running    8080     5d 12h
-node2                Running    8081     5d 12h
-node3                Stopped    8082     -
-node4                Running    8083     2h 34m
-node5                Running    8084     2h 34m
-═══════════════════════════════════════════════════════════════
+  Node          Status     Port   Version                  Uptime     Nonce        Sync
+  ─────────────────────────────────────────────────────────────────────────────────────
+  node1         Running    8080   v0.8.2                   5d 12h     12345678     Synced
+  node2         Running    8081   v0.8.2                   5d 12h     12345670     Syncing
+  node3         Stopped    8082   v0.8.2                   --         --           --
+  node4         Running    8083   v0.8.2                   2h 34m     12345678     Synced
 
-Management Options:
-  [1] Start Nodes
-  [2] Stop Nodes
-  [3] Restart Nodes
-  [4] View Node Logs
-  [5] Refresh Status
-  [6] Fix Node Permissions
-  [7] Extract BLS Public Keys
-  [b] Back to Main Menu
+Options:
+  [1] Start Nodes          [5] Refresh Status
+  [2] Stop Nodes           [6] Fix Node Permissions
+  [3] Restart Nodes        [7] Extract BLS Public Keys
+  [4] View Node Logs       [b] Back to Main Menu
 
 Select option: _
 ```
+
+* **Version**: Docker image version the node is running
+* **Nonce**: Current block nonce (retrieved via node REST API)
+* **Sync**: Shows "Synced" or "Syncing" based on the node's sync status
 
 ### Starting Nodes
 
@@ -379,20 +341,16 @@ Available nodes:
   [1] node1 (Running)
   [2] node2 (Running)
   [3] node3 (Stopped)
-  [4] node4 (Running)
-  [5] node5 (Running)
 
 Options:
   [a] All nodes
-  [1-5] Select specific node
+  [1-3] Select specific node
   [b] Back to menu
 
 Select option: 3
 
 Starting klever-node3...
 ✓ klever-node3 started successfully
-
-Press any key to continue...
 ```
 
 ### Viewing Logs
@@ -407,50 +365,17 @@ Select node to view logs:
   [1] node1 (Running)
   [2] node2 (Running)
   [3] node3 (Running)
-  [4] node4 (Running)
-  [5] node5 (Running)
 
   [b] Back to menu
 
 Select node: 1
 
 Viewing logs for klever-node1 (press Ctrl+C to exit)...
-
-[LOG OUTPUT - Live streaming]
-INFO[2025-11-06 15:23:45] Block #12345 processed
-INFO[2025-11-06 15:23:46] Consensus round completed
-...
 ```
 
 ### Fixing Permissions
 
-If you encounter permission issues:
-
-```
-Select option: 6
-
-FIX NODE PERMISSIONS
-
-Fixing permissions for node1...
-  ✓ config permissions correct (999:999)
-  ✓ db permissions correct (999:999)
-  ✓ logs permissions correct (999:999)
-  ✓ wallet permissions correct (999:999)
-All permissions set correctly for node1.
-
-Fixing permissions for node2...
-  ✓ config permissions correct (999:999)
-  ✓ db permissions correct (999:999)
-  ✓ logs permissions correct (999:999)
-  ✓ wallet permissions correct (999:999)
-All permissions set correctly for node2.
-
-[... for all nodes ...]
-
-Permission check completed for all nodes.
-
-Press any key to continue...
-```
+If you encounter permission issues, use option 6 to automatically fix ownership to `999:999` for all node directories.
 
 ### Extract BLS Public Keys
 
@@ -472,19 +397,10 @@ BLS Public Key:
 a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0...
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Node: node2
-Path: /opt/node2/config/validatorKey.pem
 
-BLS Public Key:
-b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1...
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Keys found: 2
+Keys found: 1
 
 Tip: You can copy a key by selecting it with your mouse.
-
-Press any key to continue...
 ```
 
 ---
@@ -588,6 +504,9 @@ ls -la /opt/node1/
 
 # Check permissions
 ls -la /opt/node1/config/
+
+# Script version
+sudo ./klever_node_manager.sh --version
 ```
 
 ---
@@ -596,28 +515,39 @@ ls -la /opt/node1/config/
 
 | Function | Description |
 |----|----|
-| **Create Nodes** | Creates new validator nodes with automatic setup, key generation, and smart port assignment |
-| **Update Nodes** | Updates configuration and Docker image while preserving all blockchain data and settings |
+| **Create Nodes** | Creates new validator nodes with automatic setup, key generation, tag selection, and smart port assignment |
+| **Update Nodes** | Updates configuration and Docker image with version comparison, preserving all blockchain data and settings |
 | **Start Nodes** | Starts one or all stopped nodes |
 | **Stop Nodes** | Safely stops one or all running nodes |
 | **Restart Nodes** | Restarts one or all nodes (useful after config changes) |
 | **View Logs** | Real-time log viewer for debugging and monitoring |
-| **Status Overview** | Shows all nodes with current status, ports, and uptime |
+| **Monitoring Dashboard** | Shows all nodes with status, port, version, uptime, nonce, and sync status |
 | **Fix Permissions** | Repairs directory permissions (999:999) for all node folders |
 | **Extract BLS Keys** | Displays BLS Public Keys for each node (needed for validator registration) |
 
 ---
 
-For questions or issues, please post in this thread.
+## 🔄 Changelog
+
+### v1.1.0 — 03/11/2026
+
+* **Docker Image Tag Selector**: Choose specific image versions from Docker Hub when creating or updating nodes
+* **Monitoring Dashboard**: Enhanced status view with Version, Nonce, and Sync columns (queries node REST API)
+* **Version Comparison**: Update flow now shows running vs. target version and whether a new image is available
+* **CLI Flags**: Added `--help` and `--version` command-line options
+* **curl | bash Support**: Script works correctly when piped via `curl | sudo bash`
+* **Security Hardening**: `set -u` for undefined variable detection, secure temp files with `mktemp`
+* **CI Pipeline**: GitHub Actions workflow with ShellCheck and syntax validation
+* **Code Quality**: Improved helper functions (`confirm_yn`, `make_temp_file`, `list_nodes_menu`)
+
+### v1.0.0 — 12/20/2024
+
+* Initial release
+* Create, update, and manage Klever validator nodes
+* BLS Public Key extraction
+* Automatic dependency installation (Docker, jq, bc)
+* Smart port and node number assignment
 
 ---
 
-## 🔄 Update: 12/20/2024
-
-### 🔑 BLS Key Extraction
-
-Added new feature to easily extract BLS Public Keys from your nodes.
-
-* New menu option `[7] Extract BLS Public Keys` in Node Management
-* Displays the BLS Public Key for each node (needed for validator registration)
-* Shows status for missing or invalid key files
+For questions or issues, please [open an issue](https://github.com/CTJaeger/KleverNodeManagement/issues).
