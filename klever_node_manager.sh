@@ -526,7 +526,7 @@ create_node() {
     # Fallback: individual files from GitHub (transparent & auditable)
     if [ "$config_downloaded" = false ]; then
         echo -e "${YELLOW}  Primary source unavailable, trying GitHub fallback...${RESET}"
-        local github_base="https://raw.githubusercontent.com/klever-io/klever-go/develop/config/node"
+        local github_base="https://raw.githubusercontent.com/CTJaeger/KleverNodeManagement/main/config"
         local config_files=("api.yaml" "config.yaml" "enableEpochs.yaml" "external.yaml" "gasScheduleV1.yaml" "genesis.json" "nodesSetup.json")
         local all_ok=true
 
@@ -850,7 +850,7 @@ update_node() {
     # Fallback: individual files from GitHub (transparent & auditable)
     if [ "$config_downloaded" = false ]; then
         echo -e "${YELLOW}  Primary source unavailable, trying GitHub fallback...${RESET}"
-        local github_base="https://raw.githubusercontent.com/klever-io/klever-go/develop/config/node"
+        local github_base="https://raw.githubusercontent.com/CTJaeger/KleverNodeManagement/main/config"
         local config_files=("api.yaml" "config.yaml" "enableEpochs.yaml" "external.yaml" "gasScheduleV1.yaml" "genesis.json" "nodesSetup.json")
         local all_ok=true
 
@@ -1019,7 +1019,7 @@ module_update_nodes() {
     echo -e "${WHITE}  • Total nodes to update: ${CYAN}${#nodes_to_update[@]}${RESET}"
     echo -e "${WHITE}  • Normal validators:     ${GREEN}$normal_count${RESET}"
     echo -e "${WHITE}  • Fallback nodes:        ${YELLOW}$fallback_count${RESET}"
-    echo -e "${WHITE}  • Configuration source:  ${CYAN}backup.mainnet.klever.org (fallback: klever-io/klever-go)${RESET}"
+    echo -e "${WHITE}  • Configuration source:  ${CYAN}backup.mainnet.klever.org (fallback: GitHub)${RESET}"
     echo -e "${WHITE}  • Docker image:          ${CYAN}kleverapp/klever-go:${DOCKER_IMAGE_TAG}${RESET}"
     echo
     echo -e "${WHITE}  • Running version:       ${CYAN}$current_version${RESET}"
